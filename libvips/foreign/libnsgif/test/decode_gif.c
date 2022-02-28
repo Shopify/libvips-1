@@ -21,7 +21,6 @@
 #include <sys/stat.h>
 
 
-#include <vips/vips.h>
 #include "../libnsgif.h"
 
 #define BYTES_PER_PIXEL 4
@@ -121,13 +120,10 @@ static void warning(const char *context, gif_result code)
         switch (code)
         {
         case GIF_INSUFFICIENT_FRAME_DATA:
-                fprintf(stderr, "GIF_INSUFFICIENT_FRAME_DATA");
+                fprintf(stderr, "GIF_INSUFFICIENT_FRAME_DATA or GIF_INSUFFICIENT_DATA");
                 break;
         case GIF_FRAME_DATA_ERROR:
                 fprintf(stderr, "GIF_FRAME_DATA_ERROR");
-                break;
-        case GIF_INSUFFICIENT_DATA:
-                fprintf(stderr, "GIF_INSUFFICIENT_DATA");
                 break;
         case GIF_DATA_ERROR:
                 fprintf(stderr, "GIF_DATA_ERROR");
