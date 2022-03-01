@@ -64,6 +64,7 @@ enum gif_disposal {
 #define GIF_EXTENSION_APPLICATION 0xff
 #define GIF_BLOCK_TERMINATOR 0x00
 #define GIF_TRAILER 0x3b
+#define GIF_IMAGE_SEPARATOR 0x2c
 
 /**
  * Convert an LZW result code to equivalent GIF result code.
@@ -848,8 +849,7 @@ static gif_result gif__parse_image_descriptor(
 	const uint8_t *data = *pos;
 	size_t len = gif->gif_data + gif->buffer_size - data;
 	enum {
-		GIF_IMAGE_DESCRIPTOR_LEN = 10u,
-		GIF_IMAGE_SEPARATOR      = 0x2Cu,
+		GIF_IMAGE_DESCRIPTOR_LEN = 10u
 	};
 
 	assert(gif != NULL);
@@ -1163,6 +1163,16 @@ static gif_result gif__process_frame(
 		 * silly number. */
 		if (frame_idx > 4096) {
 			return GIF_FRAME_DATA_ERROR;
+		}
+	}
+
+	// Some malformed GIFs seem to have junk data between blocks that we tolerate
+	// (up to 20 bytes of junk data between the last processed block and the current one)
+	int bad_block_id_count = 0;
+	while (pos < end && pos[0] != GIF_EXTENSION_INTRODUCER && pos[0] != GIF_IMAGE_SEPARATOR) {
+		pos++;
+		if(pos >= end || bad_block_id_count++ == 20) {
+			return GIF_DATA_ERROR;
 		}
 	}
 
