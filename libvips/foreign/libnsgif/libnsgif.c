@@ -64,6 +64,7 @@ enum gif_disposal {
 #define GIF_EXTENSION_APPLICATION 0xff
 #define GIF_BLOCK_TERMINATOR 0x00
 #define GIF_TRAILER 0x3b
+#define GIF_IMAGE_SEPARATOR 0x2c
 
 /**
  * Convert an LZW result code to equivalent GIF result code.
@@ -300,6 +301,48 @@ static inline bool gif__next_row(uint32_t interlace,
 	}
 }
 
+/**
+ * Get any frame clip adjustment for the image extent.
+ *
+ * \param[in]  frame_off  Frame's X or Y offset.
+ * \param[in]  frame_dim  Frame width or height.
+ * \param[in]  image_ext  Image width or height constraint.
+ * \return the amount the frame needs to be clipped to fit the image in given
+ *         dimension.
+ */
+static inline uint32_t gif__clip(
+		uint32_t frame_off,
+		uint32_t frame_dim,
+		uint32_t image_ext)
+{
+	uint32_t frame_ext = frame_off + frame_dim;
+
+	if (frame_ext <= image_ext) {
+		return 0;
+	}
+
+	return frame_ext - image_ext;
+}
+
+/**
+ * Perform any jump over decoded data, to accommodate clipped portion of frame.
+ *
+ * \param[in,out] skip       Number of pixels of data to jump.
+ * \param[in,out] available  Number of pixels of data currently available.
+ * \param[in,out] pos        Position in decoded pixel value data.
+ */
+static inline void gif__jump_data(
+		uint32_t *skip,
+		uint32_t *available,
+		const uint8_t **pos)
+{
+	uint32_t jump = (*skip < *available) ? *skip : *available;
+
+	*skip -= jump;
+	*available -= jump;
+	*pos += jump;
+}
+
 static gif_result gif__decode_complex(
 		struct gif_animation *gif,
 		uint32_t width,
@@ -313,12 +356,24 @@ static gif_result gif__decode_complex(
 		uint32_t *restrict colour_table)
 {
 	lzw_result res;
+	uint32_t clip_x = gif__clip(offset_x, width, gif->width);
+	uint32_t clip_y = gif__clip(offset_y, height, gif->height);
+	const uint8_t *uncompressed;
 	gif_result ret = GIF_OK;
 	uint32_t available = 0;
 	uint8_t step = 24;
+	uint32_t skip = 0;
 	uint32_t y = 0;
 
-	if (height == 0) {
+	if (offset_x >= gif->width ||
+	    offset_y >= gif->height) {
+		return GIF_OK;
+	}
+
+	width -= clip_x;
+	height -= clip_y;
+
+	if (width == 0 || height == 0) {
 		return GIF_OK;
 	}
 
@@ -339,9 +394,8 @@ static gif_result gif__decode_complex(
 
 		x = width;
 		while (x > 0) {
-			const uint8_t *uncompressed;
 			unsigned row_available;
-			if (available == 0) {
+			while (available == 0) {
 				if (res != LZW_OK) {
 					/* Unexpected end of frame, try to recover */
 					if (res == LZW_OK_EOD) {
@@ -349,10 +403,15 @@ static gif_result gif__decode_complex(
 					} else {
 						ret = gif__error_from_lzw(res);
 					}
-					break;
+					return ret;
 				}
 				res = lzw_decode(gif->lzw_ctx,
 						&uncompressed, &available);
+
+				if (available == 0) {
+					return GIF_OK;
+				}
+				gif__jump_data(&skip, &available, &uncompressed);
 			}
 
 			row_available = x < available ? x : available;
@@ -375,6 +434,9 @@ static gif_result gif__decode_complex(
 				}
 			}
 		}
+
+		skip = clip_x;
+		gif__jump_data(&skip, &available, &uncompressed);
 	} while (gif__next_row(interlace, height, &y, &step));
 
 	return ret;
@@ -393,6 +455,16 @@ static gif_result gif__decode_simple(
 	uint32_t written = 0;
 	gif_result ret = GIF_OK;
 	lzw_result res;
+
+	if (offset_y >= gif->height) {
+		return GIF_OK;
+	}
+
+	height -= gif__clip(offset_y, height, gif->height);
+
+	if (height == 0) {
+		return GIF_OK;
+	}
 
 	/* Initialise the LZW decoding */
 	res = lzw_decode_init_map(gif->lzw_ctx, data[0],
@@ -478,7 +550,10 @@ static void gif__restore_bg(
 		uint32_t width = frame->redraw_width;
 		uint32_t height = frame->redraw_height;
 
-		if (frame->display == false) {
+		width -= gif__clip(offset_x, width, gif->width);
+		height -= gif__clip(offset_y, height, gif->height);
+
+		if (frame->display == false || width == 0) {
 			return;
 		}
 
@@ -774,8 +849,7 @@ static gif_result gif__parse_image_descriptor(
 	const uint8_t *data = *pos;
 	size_t len = gif->gif_data + gif->buffer_size - data;
 	enum {
-		GIF_IMAGE_DESCRIPTOR_LEN = 10u,
-		GIF_IMAGE_SEPARATOR      = 0x2Cu,
+		GIF_IMAGE_DESCRIPTOR_LEN = 10u
 	};
 
 	assert(gif != NULL);
@@ -803,9 +877,15 @@ static gif_result gif__parse_image_descriptor(
 		frame->redraw_width  = w;
 		frame->redraw_height = h;
 
-		/* Frame size may have grown. */
-		gif->width  = (x + w > gif->width ) ? x + w : gif->width;
-		gif->height = (y + h > gif->height) ? y + h : gif->height;
+		/* Allow first frame to grow image dimensions. */
+		if (gif->frame_count == 0) {
+			if (x + w > gif->width) {
+				gif->width = x + w;
+			}
+			if (y + h > gif->height) {
+				gif->height = y + h;
+			}
+		}
 	}
 
 	*pos += GIF_IMAGE_DESCRIPTOR_LEN;
@@ -1083,6 +1163,16 @@ static gif_result gif__process_frame(
 		 * silly number. */
 		if (frame_idx > 4096) {
 			return GIF_FRAME_DATA_ERROR;
+		}
+	}
+
+	// Some malformed GIFs seem to have junk data between blocks that we tolerate
+	// (up to 20 bytes of junk data between the last processed block and the current one)
+	int bad_block_id_count = 0;
+	while (pos < end && pos[0] != GIF_EXTENSION_INTRODUCER && pos[0] != GIF_IMAGE_SEPARATOR) {
+		pos++;
+		if(pos >= end || bad_block_id_count++ == 20) {
+			return GIF_DATA_ERROR;
 		}
 	}
 
